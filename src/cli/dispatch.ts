@@ -178,7 +178,7 @@ export async function dispatch(req: RequestFrame, ctx: CallerContext): Promise<R
   }
 }
 
-registerApprovalHandler('cli_command', async ({ session, payload, userId, notify }) => {
+registerApprovalHandler('cli_command', async ({ session: _session, payload, userId: _userId, notify }) => {
   const frame = payload.frame as RequestFrame;
   const response = await dispatch(frame, { caller: 'host' });
 

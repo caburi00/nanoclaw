@@ -6,7 +6,6 @@
  * before initDb, so it has to create the dir itself).
  */
 import fs from 'fs';
-import os from 'os';
 import path from 'path';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
@@ -15,7 +14,9 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 // `import` — so it can only use globals (no path/os modules). Use require()
 // inside the callback to compute the test dir.
 const { TEST_DIR } = vi.hoisted(() => {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports -- vi.hoisted runs before `import`, so we cannot use ESM imports here (see block comment above)
   const nodePath = require('path') as typeof import('path');
+  // eslint-disable-next-line @typescript-eslint/no-require-imports -- same as above
   const nodeOs = require('os') as typeof import('os');
   return { TEST_DIR: nodePath.join(nodeOs.tmpdir(), 'nanoclaw-cb-test') };
 });
