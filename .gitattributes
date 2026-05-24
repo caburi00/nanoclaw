@@ -1,0 +1,2 @@
+# Husky hooks must be LF — bash on Linux/WSL chokes on CRLF.
+.husky/* text eol=lf
