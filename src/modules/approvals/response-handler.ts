@@ -20,10 +20,23 @@ import { writeSessionMessage } from '../../session-manager.js';
 import type { PendingApproval } from '../../types.js';
 import { ONECLI_ACTION, resolveOneCLIApproval } from './onecli-approvals.js';
 import { getApprovalHandler } from './primitive.js';
+import { hasAdminPrivilege } from '../permissions/db/user-roles.js';
+
+/**
+ * Namespace a raw platform userId from a button-click payload into the
+ * `channelType:userId` form used by the roles tables (mirrors the permissions
+ * module's sender/channel approval handlers).
+ */
+function namespaceClicker(payload: ResponsePayload): string | null {
+  if (!payload.userId) return null;
+  return payload.userId.includes(':') ? payload.userId : `${payload.channelType}:${payload.userId}`;
+}
 
 export async function handleApprovalsResponse(payload: ResponsePayload): Promise<boolean> {
+  const clickerId = namespaceClicker(payload);
+
   // OneCLI credential approvals — resolved via in-memory Promise first.
-  if (resolveOneCLIApproval(payload.questionId, payload.value)) {
+  if (resolveOneCLIApproval(payload.questionId, payload.value, clickerId)) {
     return true;
   }
 
@@ -38,14 +51,14 @@ export async function handleApprovalsResponse(payload: ResponsePayload): Promise
     return true;
   }
 
-  await handleRegisteredApproval(approval, payload.value, payload.userId ?? '');
+  await handleRegisteredApproval(approval, payload.value, clickerId);
   return true;
 }
 
 async function handleRegisteredApproval(
   approval: PendingApproval,
   selectedOption: string,
-  userId: string,
+  clickerId: string | null,
 ): Promise<void> {
   if (!approval.session_id) {
     deletePendingApproval(approval.approval_id);
@@ -71,9 +84,25 @@ async function handleRegisteredApproval(
 
   if (selectedOption !== 'approve') {
     notify(`Your ${approval.action} request was rejected by admin.`);
-    log.info('Approval rejected', { approvalId: approval.approval_id, action: approval.action, userId });
+    log.info('Approval rejected', { approvalId: approval.approval_id, action: approval.action, clickerId });
     deletePendingApproval(approval.approval_id);
     await wakeContainer(session);
+    return;
+  }
+
+  // Authorize the click before applying a registered approval (install_packages
+  // image rebuild, add_mcp_server wiring, …). Cards are DM-delivered to an
+  // admin so this normally passes; it blocks a spoofed/replayed callback from
+  // anyone else. Fail closed if the clicker or agent group is unknown. Leave
+  // the row pending so a legitimate admin can still act.
+  const authorized =
+    clickerId !== null && approval.agent_group_id !== null && hasAdminPrivilege(clickerId, approval.agent_group_id);
+  if (!authorized) {
+    log.warn('Ignoring unauthorized approval click', {
+      approvalId: approval.approval_id,
+      action: approval.action,
+      clickerId,
+    });
     return;
   }
 
@@ -92,8 +121,8 @@ async function handleRegisteredApproval(
 
   const payload = JSON.parse(approval.payload);
   try {
-    await handler({ session, payload, userId, notify });
-    log.info('Approval handled', { approvalId: approval.approval_id, action: approval.action, userId });
+    await handler({ session, payload, userId: clickerId ?? '', notify });
+    log.info('Approval handled', { approvalId: approval.approval_id, action: approval.action, clickerId });
   } catch (err) {
     log.error('Approval handler threw', { approvalId: approval.approval_id, action: approval.action, err });
     notify(

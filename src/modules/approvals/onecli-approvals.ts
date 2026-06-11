@@ -20,6 +20,7 @@
 import { OneCLI, type ApprovalRequest, type ManualApprovalHandle } from '@onecli-sh/sdk';
 
 import { pickApprovalDelivery, pickApprover } from './primitive.js';
+import { hasAdminPrivilege } from '../permissions/db/user-roles.js';
 import { ONECLI_API_KEY, ONECLI_URL } from '../../config.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
 import {
@@ -41,6 +42,10 @@ const onecli = new OneCLI({ url: ONECLI_URL, apiKey: ONECLI_API_KEY });
 interface PendingState {
   resolve: (decision: Decision) => void;
   timer: NodeJS.Timeout;
+  // For authorizing the click: the selected approver and the agent group, so a
+  // spoofed/replayed callback from anyone else can't release credentials.
+  approverId: string | null;
+  agentGroupId: string | null;
 }
 
 const pending = new Map<string, PendingState>();
@@ -65,9 +70,29 @@ function shortApprovalId(): string {
 }
 
 /** Called from the approvals response handler when a card button is clicked. */
-export function resolveOneCLIApproval(approvalId: string, selectedOption: string): boolean {
+export function resolveOneCLIApproval(approvalId: string, selectedOption: string, clickerId: string | null): boolean {
   const state = pending.get(approvalId);
   if (!state) return false;
+
+  // Authorize the clicker: must be the selected approver, or hold admin
+  // privilege on the agent group. Cards are DM-delivered to an admin so this
+  // normally passes; it rejects a spoofed/replayed callback from anyone else
+  // (credential release is high-impact). Unauthorized clicks are ignored but
+  // still "claimed" (return true) so they don't fall through to the DB path —
+  // the real approver can act later, or the request times out to deny.
+  const authorized =
+    clickerId !== null &&
+    (clickerId === state.approverId ||
+      (state.agentGroupId !== null && hasAdminPrivilege(clickerId, state.agentGroupId)));
+  if (!authorized) {
+    log.warn('Ignoring unauthorized OneCLI approval click', {
+      approvalId,
+      clickerId,
+      expectedApprover: state.approverId,
+    });
+    return true;
+  }
+
   pending.delete(approvalId);
   clearTimeout(state.timer);
 
@@ -210,7 +235,7 @@ async function handleRequest(request: ApprovalRequest): Promise<Decision> {
       resolve('deny');
     }, timeoutMs);
 
-    pending.set(approvalId, { resolve, timer });
+    pending.set(approvalId, { resolve, timer, approverId: target.userId, agentGroupId });
   });
 }
 
