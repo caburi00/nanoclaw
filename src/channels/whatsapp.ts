@@ -46,6 +46,7 @@ import { isSafeAttachmentName } from '../attachment-safety.js';
 import { ASSISTANT_HAS_OWN_NUMBER, ASSISTANT_NAME, DATA_DIR } from '../config.js';
 import { readEnvFile } from '../env.js';
 import { log } from '../log.js';
+import { getOpenCardsForChannel } from '../db/sessions.js';
 import { registerChannelAdapter } from './channel-registry.js';
 import { shouldWipeAuthOnClose } from './whatsapp-auth-policy.js';
 import { normalizeOptions, type NormalizedOption } from './ask-question.js';
@@ -887,6 +888,26 @@ registerChannelAdapter('whatsapp', {
           rejectFirstOpen = reject;
           connectSocket().catch(reject);
         });
+
+        // Rehydrate the pending-card map from the DB. pendingQuestions is
+        // in-memory and only filled on delivery, so without this an approval
+        // or ask_user_question card issued before this restart could never be
+        // answered (a typed /approve wouldn't match anything). Oldest-first so
+        // the most-recent card wins the single per-chat slot, matching the
+        // order live deliveries would have left it in.
+        try {
+          const open = getOpenCardsForChannel('whatsapp');
+          for (const card of open) {
+            pendingQuestions.set(card.platformId, { questionId: card.questionId, options: card.options });
+            if (pendingQuestions.size > PENDING_QUESTIONS_MAX) {
+              const oldest = pendingQuestions.keys().next().value!;
+              pendingQuestions.delete(oldest);
+            }
+          }
+          if (open.length > 0) log.info('Rehydrated pending question cards', { count: open.length });
+        } catch (err) {
+          log.error('Failed to rehydrate pending question cards', { err });
+        }
 
         log.info('WhatsApp adapter initialized');
       },

@@ -189,8 +189,73 @@ export function updatePendingApprovalStatus(approvalId: string, status: PendingA
   getDb().prepare('UPDATE pending_approvals SET status = ? WHERE approval_id = ?').run(status, approvalId);
 }
 
+/**
+ * Record where an approval card was actually delivered. requestApproval()
+ * creates the row before it knows the approver, then calls this once the
+ * channel adapter has sent the card. Persisting the target is what lets the
+ * channel adapter rehydrate its in-memory pending-question map after a
+ * restart (otherwise an approval issued before a restart can never be
+ * answered) and makes `approvals list` show the real destination instead of
+ * NULL columns.
+ */
+export function updatePendingApprovalDelivery(
+  approvalId: string,
+  channelType: string,
+  platformId: string,
+  platformMessageId: string | null,
+): void {
+  getDb()
+    .prepare(
+      'UPDATE pending_approvals SET channel_type = ?, platform_id = ?, platform_message_id = ? WHERE approval_id = ?',
+    )
+    .run(channelType, platformId, platformMessageId, approvalId);
+}
+
 export function deletePendingApproval(approvalId: string): void {
   getDb().prepare('DELETE FROM pending_approvals WHERE approval_id = ?').run(approvalId);
+}
+
+/**
+ * An open (unanswered) question/approval card that was delivered to a given
+ * channel. Used by channel adapters to rehydrate their in-memory
+ * "chatJid → pending card" map on startup so cards issued before a restart
+ * stay answerable. `platformId` is the chat the card was delivered to.
+ */
+export interface OpenChannelCard {
+  questionId: string;
+  platformId: string;
+  options: import('../channels/ask-question.js').NormalizedOption[];
+  createdAt: string;
+}
+
+/**
+ * All still-open cards delivered to `channelType`, oldest first — both
+ * generic ask_user_question rows (pending_questions) and approval cards
+ * (pending_approvals, status='pending'). Only rows with a recorded
+ * platform_id are returned (older approval rows predating delivery-target
+ * persistence have NULL platform_id and can't be located). Oldest-first so a
+ * caller folding these into a single-slot-per-chat map ends on the most
+ * recent card, matching live delivery order.
+ */
+export function getOpenCardsForChannel(channelType: string): OpenChannelCard[] {
+  const rows = getDb()
+    .prepare(
+      `SELECT question_id AS questionId, platform_id AS platformId, options_json AS optionsJson, created_at AS createdAt
+         FROM pending_questions
+        WHERE channel_type = ? AND platform_id IS NOT NULL
+       UNION ALL
+       SELECT approval_id AS questionId, platform_id AS platformId, options_json AS optionsJson, created_at AS createdAt
+         FROM pending_approvals
+        WHERE channel_type = ? AND platform_id IS NOT NULL AND status = 'pending'
+       ORDER BY createdAt ASC`,
+    )
+    .all(channelType, channelType) as Array<{
+    questionId: string;
+    platformId: string;
+    optionsJson: string;
+    createdAt: string;
+  }>;
+  return rows.map(({ optionsJson, ...rest }) => ({ ...rest, options: JSON.parse(optionsJson) }));
 }
 
 export function getPendingApprovalsByAction(action: string): PendingApproval[] {
