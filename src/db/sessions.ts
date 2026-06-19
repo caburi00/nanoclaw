@@ -229,16 +229,30 @@ export interface OpenChannelCard {
 }
 
 /**
- * All still-open cards delivered to `channelType`, oldest first — both
- * generic ask_user_question rows (pending_questions) and approval cards
- * (pending_approvals, status='pending'). Only rows with a recorded
- * platform_id are returned (older approval rows predating delivery-target
- * persistence have NULL platform_id and can't be located). Oldest-first so a
- * caller folding these into a single-slot-per-chat map ends on the most
- * recent card, matching live delivery order.
+ * All still-open cards delivered to `channelType`, oldest first. Covers every
+ * table whose cards are answered via the channel adapter's slash-command path:
+ *   - pending_questions        (ask_user_question)
+ *   - pending_approvals        (cli_command / self-mod, status='pending')
+ *   - pending_sender_approvals (unknown-sender Allow/Deny)
+ *   - pending_channel_approvals(bot-mentioned-in-new-channel)
+ *
+ * The first two record their delivery target directly (channel_type +
+ * platform_id) and are skipped if platform_id is NULL (older rows predating
+ * delivery-target persistence). The latter two don't have those columns — the
+ * card went to the approver's DM, whose chatJid is `approver_user_id` minus
+ * its "channelType:" prefix — so the target is derived from approver_user_id.
+ * questionId matches what each card was delivered with: the row id for sender
+ * approvals, the messaging_group_id for channel approvals.
+ *
+ * Oldest-first so a caller folding these into a single-slot-per-chat map ends
+ * on the most recent card, matching live delivery order.
  */
 export function getOpenCardsForChannel(channelType: string): OpenChannelCard[] {
-  const rows = getDb()
+  const db = getDb();
+  const out: OpenChannelCard[] = [];
+
+  // Cards that store their delivery target explicitly.
+  const direct = db
     .prepare(
       `SELECT question_id AS questionId, platform_id AS platformId, options_json AS optionsJson, created_at AS createdAt
          FROM pending_questions
@@ -246,8 +260,7 @@ export function getOpenCardsForChannel(channelType: string): OpenChannelCard[] {
        UNION ALL
        SELECT approval_id AS questionId, platform_id AS platformId, options_json AS optionsJson, created_at AS createdAt
          FROM pending_approvals
-        WHERE channel_type = ? AND platform_id IS NOT NULL AND status = 'pending'
-       ORDER BY createdAt ASC`,
+        WHERE channel_type = ? AND platform_id IS NOT NULL AND status = 'pending'`,
     )
     .all(channelType, channelType) as Array<{
     questionId: string;
@@ -255,7 +268,47 @@ export function getOpenCardsForChannel(channelType: string): OpenChannelCard[] {
     optionsJson: string;
     createdAt: string;
   }>;
-  return rows.map(({ optionsJson, ...rest }) => ({ ...rest, options: JSON.parse(optionsJson) }));
+  for (const r of direct) {
+    out.push({
+      questionId: r.questionId,
+      platformId: r.platformId,
+      options: JSON.parse(r.optionsJson),
+      createdAt: r.createdAt,
+    });
+  }
+
+  // Cards whose delivery target is derived from approver_user_id. These are
+  // optional-module tables, so guard with hasTable.
+  const derived: Array<{ questionId: string; approver: string; optionsJson: string; createdAt: string }> = [];
+  if (hasTable(db, 'pending_sender_approvals')) {
+    derived.push(
+      ...(db
+        .prepare(
+          'SELECT id AS questionId, approver_user_id AS approver, options_json AS optionsJson, created_at AS createdAt FROM pending_sender_approvals',
+        )
+        .all() as typeof derived),
+    );
+  }
+  if (hasTable(db, 'pending_channel_approvals')) {
+    derived.push(
+      ...(db
+        .prepare(
+          'SELECT messaging_group_id AS questionId, approver_user_id AS approver, options_json AS optionsJson, created_at AS createdAt FROM pending_channel_approvals',
+        )
+        .all() as typeof derived),
+    );
+  }
+  for (const r of derived) {
+    const sep = r.approver.indexOf(':');
+    if (sep < 0 || r.approver.slice(0, sep) !== channelType) continue;
+    const platformId = r.approver.slice(sep + 1);
+    if (!platformId) continue;
+    out.push({ questionId: r.questionId, platformId, options: JSON.parse(r.optionsJson), createdAt: r.createdAt });
+  }
+
+  // Oldest-first → most recent card wins a single-slot-per-chat consumer.
+  out.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  return out;
 }
 
 export function getPendingApprovalsByAction(action: string): PendingApproval[] {

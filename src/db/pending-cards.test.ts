@@ -5,7 +5,8 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 
-import { closeDb, initTestDb, runMigrations } from './index.js';
+import { closeDb, createAgentGroup, initTestDb, runMigrations } from './index.js';
+import { getDb } from './connection.js';
 import {
   createPendingApproval,
   getOpenCardsForChannel,
@@ -78,5 +79,36 @@ describe('getOpenCardsForChannel', () => {
 
     const ids = getOpenCardsForChannel('whatsapp').map((c) => c.questionId);
     expect(ids).toEqual(['appr-old', 'appr-new']);
+  });
+
+  it('derives sender/channel approval targets from approver_user_id, scoped by channel', () => {
+    const db = getDb();
+    createAgentGroup({ id: 'ag-x', name: 'X', folder: 'x', agent_provider: null, created_at: now() });
+    db.prepare(
+      `INSERT INTO messaging_groups (id, channel_type, platform_id, name, is_group, unknown_sender_policy, created_at)
+       VALUES ('mg-x', 'whatsapp', '123@g.us', 'G', 1, 'request_approval', ?)`,
+    ).run(now());
+    const opts = JSON.stringify([
+      { label: 'Allow', selectedLabel: '✅', value: 'approve' },
+      { label: 'Deny', selectedLabel: '❌', value: 'reject' },
+    ]);
+    db.prepare(
+      `INSERT INTO pending_sender_approvals
+         (id, messaging_group_id, agent_group_id, sender_identity, sender_name, original_message, approver_user_id, created_at, title, options_json)
+       VALUES ('nsa-1', 'mg-x', 'ag-x', 'whatsapp:999@s.whatsapp.net', '999', '{}', 'whatsapp:6594599775@s.whatsapp.net', ?, '👤 New sender', ?)`,
+    ).run(now(), opts);
+    db.prepare(
+      `INSERT INTO pending_channel_approvals
+         (messaging_group_id, agent_group_id, original_message, approver_user_id, created_at, title, options_json)
+       VALUES ('mg-x', 'ag-x', '{}', 'whatsapp:6594599775@s.whatsapp.net', ?, '📣 New channel', ?)`,
+    ).run(now(), opts);
+
+    const wa = getOpenCardsForChannel('whatsapp');
+    // sender card → questionId is the row id; channel card → questionId is the messaging_group_id.
+    expect(wa.find((c) => c.questionId === 'nsa-1')?.platformId).toBe('6594599775@s.whatsapp.net');
+    expect(wa.find((c) => c.questionId === 'mg-x')?.platformId).toBe('6594599775@s.whatsapp.net');
+
+    // A different channel sees neither (approver prefix is whatsapp).
+    expect(getOpenCardsForChannel('telegram')).toHaveLength(0);
   });
 });
